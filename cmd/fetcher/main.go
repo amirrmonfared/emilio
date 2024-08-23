@@ -31,6 +31,9 @@ type options struct {
 	ImapServer string
 	Port       string
 	UseTLS     bool
+	Unread     bool
+	Today      bool
+	Since      string
 }
 
 func gatherOptions() options {
@@ -42,6 +45,9 @@ func gatherOptions() options {
 	fs.StringVar(&o.ImapServer, "imap-server", "", "IMAP server")
 	fs.StringVar(&o.Port, "port", "993", "IMAP port")
 	fs.BoolVar(&o.UseTLS, "use-tls", true, "Use TLS")
+	fs.BoolVar(&o.Unread, "unread", false, "Fetch only unread emails")
+	fs.BoolVar(&o.Today, "today", false, "Fetch only emails received today")
+	fs.StringVar(&o.Since, "since", "", "Fetch emails since a specific date (YYYY-MM-DD)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		logrus.WithError(err).Fatal("failed to parse the arguments")
@@ -99,16 +105,32 @@ func connect(o options) error {
 	logrus.WithField("mailbox", mbox).Info("Mailbox status")
 
 	criteria := imap.NewSearchCriteria()
-	criteria.WithoutFlags = []string{"\\Seen"}
+
+	if o.Unread {
+		criteria.WithoutFlags = []string{"\\Seen"}
+	}
+	if o.Today {
+		today := time.Now().Truncate(24 * time.Hour)
+		criteria.Since = today
+	}
+	if o.Since != "" {
+		parsedDate, err := time.Parse("2006-01-02", o.Since)
+		if err != nil {
+			return fmt.Errorf("invalid date format for 'since' argument: %v", err)
+		}
+		criteria.Since = parsedDate
+	}
+
 	ids, err := c.Search(criteria)
 	if err != nil {
 		return fmt.Errorf("unable to search emails: %v", err)
 	}
 	if len(ids) == 0 {
-		logrus.Info("No unseen emails")
+		logrus.Info("No emails found with the specified criteria")
 		return nil
 	}
 
+	// TODO: Remove limit processing to 10 emails for the demo
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(ids...)
 	messages := make(chan *imap.Message, 10)
@@ -118,10 +140,15 @@ func connect(o options) error {
 	}
 
 	var errs []error
+	emailCount := 0
 	for msg := range messages {
 		logrus.WithField("subject", msg.Envelope.Subject).Info("Email received")
 		if err := processEmail(msg); err != nil {
 			errs = append(errs, err)
+		}
+		emailCount++
+		if emailCount >= 10 {
+			break 
 		}
 	}
 
@@ -129,7 +156,7 @@ func connect(o options) error {
 }
 
 func processEmail(msg *imap.Message) error {
-	// Dummy AI categorization (will be replace with actual AI model call)
+	// Dummy AI categorization (will be replaced with actual AI model call)
 	category := categorizeEmail(msg.Envelope.Subject)
 	logrus.WithField("subject", msg.Envelope.Subject).WithField("category", category).Info("Categorized email")
 
