@@ -1,29 +1,22 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/openai"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/errors"
 )
-
-// fetch the emails
-// read the emails and pass it to AI model to categorize the emails
-// label emails in the user's inbox
-// summarize the emails and send it to the user
-// move junk emails to the spam folder
-// clean up the inbox by moving emails to the archive folder after a certain period of time by user's preference
-// prioritize emails based on the user's preference from a certain sender
-// notify the user when an email is received from a certain sender
-// notify the user when an email is received with a certain keyword
-// understand user if they moved email to a folder and learn from it like spam to inbox or important to archive and etc.
-// have a folder when they expect a reply from the email they sent and notify them if they didn't receive a reply after a certain period of time
 
 type options struct {
 	Username   string
@@ -34,6 +27,8 @@ type options struct {
 	Unread     bool
 	Today      bool
 	Since      string
+	APIKey     string
+	Model      string
 }
 
 func gatherOptions() options {
@@ -48,6 +43,8 @@ func gatherOptions() options {
 	fs.BoolVar(&o.Unread, "unread", false, "Fetch only unread emails")
 	fs.BoolVar(&o.Today, "today", false, "Fetch only emails received today")
 	fs.StringVar(&o.Since, "since", "", "Fetch emails since a specific date (YYYY-MM-DD)")
+	fs.StringVar(&o.APIKey, "api-key", "", "OpenAI API Key")
+	fs.StringVar(&o.Model, "model", "gpt-4o-mini", "OpenAI model to use")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		logrus.WithError(err).Fatal("failed to parse the arguments")
@@ -68,6 +65,9 @@ func (o options) validate() error {
 	if o.ImapServer == "" {
 		errs = append(errs, fmt.Errorf("IMAP server is required"))
 	}
+	if o.APIKey == "" {
+		errs = append(errs, fmt.Errorf("OpenAI API Key is required"))
+	}
 
 	return errors.NewAggregate(errs)
 }
@@ -81,12 +81,19 @@ func main() {
 		logger.WithError(err).Fatal("invalid options")
 	}
 
-	if err := connect(o); err != nil {
-		logger.WithError(err).Fatal("failed to connect to the IMAP server")
+	ctx := context.Background()
+
+	llm, err := openai.New(openai.WithToken(o.APIKey))
+	if err != nil {
+		log.Fatalf("Failed to initialize LLM: %v", err)
+	}
+
+	if err := connectAndProcessEmails(ctx, o, llm); err != nil {
+		logger.WithError(err).Fatal("failed to process emails")
 	}
 }
 
-func connect(o options) error {
+func connectAndProcessEmails(ctx context.Context, o options, llm llms.Model) error {
 	c, err := client.DialTLS(fmt.Sprintf("%s:%s", o.ImapServer, o.Port), nil)
 	if err != nil {
 		return fmt.Errorf("unable to connect to the IMAP server: %v", err)
@@ -130,11 +137,10 @@ func connect(o options) error {
 		return nil
 	}
 
-	// TODO: Remove limit processing to 10 emails for the demo
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(ids...)
 	messages := make(chan *imap.Message, 10)
-	err = c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope}, messages)
+	err = c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchBody}, messages)
 	if err != nil {
 		return fmt.Errorf("unable to fetch emails: %v", err)
 	}
@@ -143,21 +149,22 @@ func connect(o options) error {
 	emailCount := 0
 	for msg := range messages {
 		logrus.WithField("subject", msg.Envelope.Subject).Info("Email received")
-		if err := processEmail(msg); err != nil {
+		if err := processEmail(ctx, msg, llm); err != nil {
 			errs = append(errs, err)
 		}
 		emailCount++
 		if emailCount >= 10 {
-			break 
+			break
 		}
 	}
 
 	return errors.NewAggregate(errs)
 }
 
-func processEmail(msg *imap.Message) error {
-	// Dummy AI categorization (will be replaced with actual AI model call)
-	category := categorizeEmail(msg.Envelope.Subject)
+func processEmail(ctx context.Context, msg *imap.Message, llm llms.Model) error {
+	emailContent := fmt.Sprintf("Subject: %s\nFrom: %v\nDate: %v\n", msg.Envelope.Subject, msg.Envelope.From, msg.Envelope.Date)
+
+	category := categorizeEmail(ctx, emailContent, llm)
 	logrus.WithField("subject", msg.Envelope.Subject).WithField("category", category).Info("Categorized email")
 
 	prioritySenders := []string{"important@company.com"}
@@ -177,12 +184,15 @@ func processEmail(msg *imap.Message) error {
 	return nil
 }
 
-// dummy categorize email function
-func categorizeEmail(subject string) string {
-	if strings.Contains(strings.ToLower(subject), "offer") {
-		return "junk"
+func categorizeEmail(ctx context.Context, emailContent string, llm llms.Model) string {
+	completion, err := llm.Call(ctx, emailContent, llms.WithTemperature(0.8))
+	if err != nil {
+		log.Fatalf("Failed to categorize email: %v", err)
 	}
-	return "general"
+
+	category := strings.TrimSpace(completion)
+	log.Printf("Categorized email as: %s", category)
+	return category
 }
 
 func containsSender(prioritySenders []string, from []*imap.Address) bool {
